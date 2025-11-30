@@ -1,0 +1,7 @@
+numpy>=1.21.0
+scipy>=1.7.0
+matplotlib>=3.5.0
+pyzmq>=22.0.0
+PyAutoGUI>=0.9.50
+PyQt5>=5.15.0
+brainaccess>=0.1.0
