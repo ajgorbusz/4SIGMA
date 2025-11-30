@@ -2,13 +2,12 @@ import numpy as np
 import time
 import sys
 import zmq
-from scipy.signal import butter, sosfilt, welch
+from scipy.signal import welch
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 import matplotlib
-from collections import deque
 
-# --- IMPORTY BRAINACCESS ---
+# --- BRAINACCESS IMPORTS ---
 from brainaccess.utils import acquisition
 from brainaccess.core.eeg_manager import EEGManager
 
@@ -16,247 +15,149 @@ from brainaccess.core.eeg_manager import EEGManager
 matplotlib.use("QtAgg", force=True)
 
 DEVICE_NAME = "BA HALO 057"
-SFREQ = 250
-ANALYSIS_CHANNELS = ['Fp1', 'Fp2'] 
+SAMPLING_FREQ = 250
+CHANNELS_TO_ANALYZE = ['Fp1', 'Fp2'] 
 
 # --- ZMQ CONFIGURATION (PUBLISHING) ---
-ZMQ_PORT_DATA = 6000      # Port for broadcasting raw data (Relay)
-ZMQ_PORT_DECISION = 5556  # Port for sending decisions to Core Unit
+ZMQ_PORT_DATA_RELAY = 6000      # Raw data relay
+ZMQ_PORT_DECISION = 5556        # Decisions to Core Unit
 
 # Relay Config
 ALL_CHANNELS_OUT = ["Fp1", "Fp2", "O1", "O2"]
 HALO_CHANNELS_MAP = {0: "Fp1", 1: "Fp2", 2: "O1", 3: "O2"}
 
 # Time Windows
-PLOT_WINDOW_TIME = 4.0      
-FFT_WINDOW_TIME = 0.5       # Short window for fast reaction
+ANALYSIS_WINDOW_TIME = 4.0      
+FFT_WINDOW = 0.5              
 
-# Detection Config
-CALIBRATION_TIME = 3.0      # Time to gather background noise
+# Thresholds (Teeth vs Head)
+HEAD_THRESHOLD_MULTIPLIER = 20.0 
+TEETH_THRESHOLD_MULTIPLIER = 3.0 
 
-# THRESHOLDS (Multipliers relative to background noise)
-JAW_LOWER_MULTIPLIER = 1.5    # Minimum power to detect jaw clench (1.5x background)
-HEAD_UPPER_MULTIPLIER = 100.0 # If power > 100x background -> Head movement (ignore as jaw)
+# Global objects
+eeg_manager = EEGManager()
+socket_relay = None
+socket_decision = None
 
-# Frequency Bands
-JAW_BAND = (55, 90)   # High freq for EMG
-HEAD_BAND = (1, 5)    # Low freq for EOG/Movement
-
-# --- GLOBAL VARIABLES ---
-eeg = acquisition.EEG()
-buffer_samples = int(SFREQ * PLOT_WINDOW_TIME)
-# Buffers
-data_buffer = deque([0]*buffer_samples, maxlen=buffer_samples) # Signal
-power_buffer = deque([0]*buffer_samples, maxlen=buffer_samples) # Power history
-times_buffer = np.linspace(-PLOT_WINDOW_TIME, 0, buffer_samples)
-
-# Calibration State
-background_power_jaw = 1.0
-background_power_head = 1.0
-is_calibrated = False
-calibration_start_time = 0
-
-# --- 1. SIGNAL PROCESSING TOOLS ---
-def create_filters(sfreq):
-    # Notch filter (50Hz)
-    sos_notch = butter(4, [48, 52], btype='bandstop', fs=sfreq, output='sos')
-    # Bandpass (1-100Hz)
-    sos_band = butter(4, [1, 100], btype='bandpass', fs=sfreq, output='sos')
-    return sos_notch, sos_band
-
-sos_notch, sos_band = create_filters(SFREQ)
-
-def get_band_power(data, band, sfreq):
-    """Calculates mean power in a specific frequency band using Welch method."""
-    nperseg = min(len(data), int(FFT_WINDOW_TIME * sfreq))
-    freqs, psd = welch(data, fs=sfreq, nperseg=nperseg)
-    
-    idx_min = np.searchsorted(freqs, band[0])
-    idx_max = np.searchsorted(freqs, band[1])
-    
-    if idx_max <= idx_min: return 0.0
-    return np.mean(psd[idx_min:idx_max])
-
-# --- 2. MAIN LOGIC & ANIMATION ---
-def run_fourier_analysis():
-    global is_calibrated, calibration_start_time
-    global background_power_jaw, background_power_head
+def run_move_detector():
+    """
+    Main function setting up hardware, ZMQ, and animation loop.
+    """
+    global socket_relay, socket_decision, eeg_manager
 
     # --- ZMQ SETUP ---
     context = zmq.Context()
+    socket_relay = context.socket(zmq.PUB)
+    socket_relay.bind(f"tcp://*:{ZMQ_PORT_DATA_RELAY}")
     
-    # PUB Socket: Raw Data Relay (for blink detector)
-    pub_data = context.socket(zmq.PUB)
-    pub_data.bind(f"tcp://*:{ZMQ_PORT_DATA}")
-    
-    # PUB Socket: Decisions (for Core Unit)
-    pub_decision = context.socket(zmq.PUB)
-    pub_decision.bind(f"tcp://*:{ZMQ_PORT_DECISION}")
+    socket_decision = context.socket(zmq.PUB)
+    socket_decision.bind(f"tcp://*:{ZMQ_PORT_DECISION}")
 
-    # BrainAccess Acquisition Setup
-    mgr = setup_acquisition()
-    if not mgr: return
+    # --- HARDWARE CONNECTION ---
+    print(f"Connecting to system {DEVICE_NAME}...")
+    try:
+        eeg_manager.setup(acquisition, device_name=DEVICE_NAME, cap=HALO_CHANNELS_MAP, sfreq=SAMPLING_FREQ)
+        eeg_manager.start_acquisition()
+        time.sleep(1.0)
+        print("Acquisition started.")
+    except Exception as e:
+        print(f"Hardware Connection Error: {e}")
+        return
 
     # --- PLOT SETUP ---
     fig, ax = plt.subplots(2, 1, figsize=(10, 8))
-    plt.subplots_adjust(hspace=0.4)
     
-    # Plot 1: Filtered Signal
-    lines = []
-    line1, = ax[0].plot(times_buffer, np.zeros(buffer_samples), color='black', lw=1)
-    lines.append(line1)
-    ax[0].set_title("Filtered Signal (Fp1/Fp2 Avg)")
+    # Plot 1: Time Series
+    line_time, = ax[0].plot([], [], lw=1)
+    ax[0].set_title("Raw EEG Signal (Fp1)")
+    ax[0].set_xlim(0, ANALYSIS_WINDOW_TIME)
     ax[0].set_ylim(-100, 100)
 
-    # Plot 2: Power Ratio (Jaw)
-    line2, = ax[1].plot(times_buffer, np.zeros(buffer_samples), color='purple', lw=2)
-    lines.append(line2)
-    ax[1].set_title("Jaw Band Power Ratio (Normalized)")
-    ax[1].set_ylim(0, 10)
+    # Plot 2: Power/Decision Metric
+    line_power, = ax[1].plot([], [], lw=2, color='orange')
+    ax[1].set_title("Decision Metric (Power)")
+    ax[1].set_xlim(0, ANALYSIS_WINDOW_TIME)
+    ax[1].set_ylim(0, 100)
+
+    # Buffers
+    buffer_len = int(ANALYSIS_WINDOW_TIME * SAMPLING_FREQ)
+    times_buffer = np.linspace(0, ANALYSIS_WINDOW_TIME, buffer_len)
     
-    # Threshold lines
-    line_thresh_low = ax[1].axhline(JAW_LOWER_MULTIPLIER, color='green', linestyle='--', label='Jaw Threshold')
-    line_thresh_high = ax[1].axhline(HEAD_UPPER_MULTIPLIER, color='red', linestyle='--', label='Head Movement Limit')
-    ax[1].legend()
+    signal_buffer = np.zeros(buffer_len)
+    power_buffer = np.zeros(buffer_len)
 
-    calibration_start_time = time.time()
-    print("Collecting calibration data (3s)... Please sit still.")
-
-    def update(frame):
-        nonlocal pub_data, pub_decision
-        global is_calibrated, background_power_jaw, background_power_head
+    def update_plot(frame):
+        nonlocal signal_buffer, power_buffer
         
+        # 1. Get Data chunk
+        data = eeg_manager.get_data()
+        if data is None or data.shape[1] == 0:
+            return [line_time, line_power]
+
+        # 2. RELAY RAW DATA (To Blink Detector)
         try:
-            # A. Fetch Data
-            new_data = eeg.get_data()
-            if new_data is None: return lines
+            msg = {"data": data.tolist()}
+            socket_relay.send_json(msg)
+        except Exception:
+            pass
 
-            # B. ZMQ RELAY: Send raw data for other scripts (Blink Detector)
-            # Create dict {'Fp1': val, 'Fp2': val...}
-            relay_msg = {}
-            for ch_idx, ch_name in HALO_CHANNELS_MAP.items():
-                if ch_idx < len(new_data):
-                    # Take the last sample
-                    relay_msg[ch_name] = new_data[ch_idx][-1]
-            pub_data.send_json(relay_msg)
+        # 3. ANALYSIS (Fp1 only)
+        new_samples = data.shape[1]
+        fp1_data = data[0, :] 
 
-            # C. Processing for Fourier
-            # Extract Fp1, Fp2
-            chunk_fp1 = new_data[0]
-            chunk_fp2 = new_data[1]
-            
-            # Average channels (Fp1+Fp2)/2
-            chunk_avg = (chunk_fp1 + chunk_fp2) / 2
-            
-            # Add to buffer
-            data_buffer.extend(chunk_avg)
-            
-            # Not enough data yet
-            if len(data_buffer) < buffer_samples: return lines
+        # Update Signal Buffer
+        signal_buffer = np.roll(signal_buffer, -new_samples)
+        signal_buffer[-new_samples:] = fp1_data
 
-            # Convert to numpy
-            sig_raw = np.array(data_buffer) * 1e6 # uV
-            
-            # Filter
-            filtered_signal = sosfilt(sos_band, sosfilt(sos_notch, sig_raw))
+        # 4. FFT / WELCH
+        # Analyze last 0.5s
+        n_analyze = int(0.5 * SAMPLING_FREQ)
+        segment = signal_buffer[-n_analyze:]
+        
+        freqs, psd = welch(segment, fs=SAMPLING_FREQ, nperseg=n_analyze//2)
+        
+        # Bands
+        idx_low = np.logical_and(freqs >= 1, freqs <= 4)   # Movement
+        idx_high = np.logical_and(freqs >= 20, freqs <= 80) # Muscle (EMG)
+        
+        power_low = np.mean(psd[idx_low]) if np.any(idx_low) else 0
+        power_high = np.mean(psd[idx_high]) if np.any(idx_high) else 0
+        
+        move_signal = 0
+        score = power_high
+        
+        power_buffer = np.roll(power_buffer, -new_samples)
+        power_buffer[-new_samples:] = score
 
-            # --- D. CALIBRATION PHASE ---
-            if not is_calibrated:
-                if time.time() - calibration_start_time < CALIBRATION_TIME:
-                    return lines
-                else:
-                    # Calculate baseline noise levels
-                    background_power_jaw = get_band_power(filtered_signal, JAW_BAND, SFREQ)
-                    background_power_head = get_band_power(filtered_signal, HEAD_BAND, SFREQ)
-                    
-                    # Safety check to avoid division by zero
-                    background_power_jaw = max(background_power_jaw, 0.1)
-                    background_power_head = max(background_power_head, 0.1)
-                    
-                    is_calibrated = True
-                    print(f"CALIBRATION DONE.")
-                    print(f"Base Jaw Power: {background_power_jaw:.2f}")
-                    print(f"Base Head Power: {background_power_head:.2f}")
+        # THRESHOLDS
+        # Simple logic: High power = clench, unless low power is also huge (head movement)
+        if power_high > 50.0: 
+             if power_low < power_high: 
+                 print(f"Command: NEXT SLIDE (Clench) | Power: {power_high:.1f}")
+                 move_signal = 1
+        
+        # SEND DECISION
+        if move_signal != 0:
+            socket_decision.send_json({"move": move_signal})
 
-            # --- E. LIVE ANALYSIS ---
-            if is_calibrated:
-                # Analyze recent window
-                fft_window_samples = int(FFT_WINDOW_TIME * SFREQ)
-                recent_signal = filtered_signal[-fft_window_samples:]
-                
-                # Current powers
-                current_jaw_pwr = get_band_power(recent_signal, JAW_BAND, SFREQ)
-                current_head_pwr = get_band_power(recent_signal, HEAD_BAND, SFREQ)
-                
-                # Calculate Ratios (Signal-to-Noise)
-                ratio_jaw = current_jaw_pwr / background_power_jaw
-                ratio_head = current_head_pwr / background_power_head
-                
-                # --- DECISION LOGIC ---
-                clench_detected = False
-                head_movement_detected = False
-                
-                decision_signal = 0 # 0=Nothing, 1=Right(Jaw), -1=Left(Head)
+        # GRAPHICS UPDATE
+        line_time.set_ydata(signal_buffer)
+        line_time.set_xdata(times_buffer)
+        ax[0].set_ylim(np.min(signal_buffer), np.max(signal_buffer) + 10)
+        
+        line_power.set_ydata(power_buffer)
+        line_power.set_xdata(times_buffer)
+        ax[1].set_ylim(0, np.max(power_buffer) + 10)
 
-                # 1. Check HEAD (High priority block)
-                if ratio_head > HEAD_UPPER_MULTIPLIER:
-                    # Too much movement -> HEAD GESTURE (Previous Slide)
-                    head_movement_detected = True
-                    decision_signal = -1
-                    print(f"HEAD MOVEMENT! Ratio: {ratio_head:.1f}")
-                
-                # 2. Check JAW (Only if head is stable-ish)
-                elif ratio_jaw > JAW_LOWER_MULTIPLIER:
-                    # Jaw clench -> NEXT SLIDE
-                    clench_detected = True
-                    decision_signal = 1
-                    print(f"JAW CLENCH! Ratio: {ratio_jaw:.1f}")
+        return [line_time, line_power]
 
-                # Send Decision via ZMQ
-                if decision_signal != 0:
-                    pub_decision.send_json({"move": decision_signal})
-
-                # --- VISUALIZATION UPDATE ---
-                # Update power buffer for plotting (visualize the score)
-                # Determine which score to show (Jaw Ratio usually)
-                normalized_score = min(ratio_jaw, 20.0)
-                
-                new_len = len(chunk_avg)
-                # Shift and append
-                for _ in range(new_len):
-                    power_buffer.append(normalized_score)
-
-            # Update Plot Lines
-            lines[0].set_ydata(filtered_signal)
-            lines[0].set_xdata(times_buffer)
-            limit0 = max(np.max(np.abs(filtered_signal)), 10.0) * 1.1
-            ax[0].set_ylim(-limit0, limit0)
-            
-            lines[1].set_ydata(power_buffer)
-            lines[1].set_xdata(times_buffer)
-            current_max = np.max(power_buffer)
-            y_max = max(HEAD_UPPER_MULTIPLIER * 1.5, current_max * 1.2)
-            ax[1].set_ylim(0.5, y_max) 
-
-        except Exception as e:
-            print(f"\nFATAL ERROR: {e}")
-            return lines
-
-        return lines
-
-if __name__ == '__main__':
-    def setup_acquisition():
-        global eeg
-        print(f"Connecting to device {DEVICE_NAME}...")
-        try:
-            mgr = EEGManager()
-            eeg.setup(mgr, device_name=DEVICE_NAME, cap=HALO_CHANNELS_MAP, sfreq=SFREQ)
-            eeg.start_acquisition()
-            time.sleep(1.0)
-            return mgr
-        except Exception as e:
-            print(f"Connection Failed: {e}")
-            return None
-
-    ani = FuncAnimation(plt.gcf(), run_fourier_analysis(), interval=50, blit=False, cache_frame_data=False)
+    ani = FuncAnimation(fig, update_plot, interval=50, blit=True)
     plt.show()
+
+    # Cleanup
+    eeg_manager.stop_acquisition()
+    eeg_manager.close()
+    context.term()
+
+if __name__ == "__main__":
+    run_move_detector()

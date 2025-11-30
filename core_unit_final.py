@@ -1,119 +1,141 @@
 import zmq
 import time
 
-# --- CONFIGURATION CONSTANTS ---
+# --- CONFIGURATION ---
 READY_TIME = 3.0
 REST_TIME = 2.0
 
-# Protocol Flags
-FLAGS = {"BLI": 0, "RDY": 1, "RST": 2}
-# System States
-STATES = {"BLINK_WAIT": 0, "WAIT": 1, "MOVE_WAIT": 2, "REST": 3}
+# Communication Flags
+FLAGS = {
+    "BLINK_WAIT": 0, 
+    "READY": 1, 
+    "REST": 2
+}
 
-def core_unit():
-    """
-    Main state machine managing the flow between blink detection,
-    waiting periods, and movement command execution.
-    """
-    # Initialize ZMQ Context
+# State Machine States
+STATES = {
+    "WAIT_FOR_BLINK": 0, 
+    "PREPARE_TO_LISTEN": 1, 
+    "WAIT_FOR_MOVE": 2, 
+    "RESTING": 3
+}
+
+def run_core_unit():
+    # Defining sockets
     context = zmq.Context()
-    print("Core unit initializing...")
+    print("Core Unit: Initializing...")
 
-    # --- SOCKET SETUP ---
+    # --- 1. SIGNAL RECEPTION (Subscribers) ---
+    blink_sub = context.socket(zmq.SUB)
+    blink_sub.connect("tcp://localhost:5555")
+    blink_sub.setsockopt_string(zmq.SUBSCRIBE, "")
+
+    move_sub = context.socket(zmq.SUB)
+    move_sub.connect("tcp://localhost:5556")
+    move_sub.setsockopt_string(zmq.SUBSCRIBE, "")
+
+    # --- 2. STATE BROADCASTING (Publishers) ---
+    led_pub = context.socket(zmq.PUB)
+    led_pub.bind("tcp://*:5557")
+
+    slide_pub = context.socket(zmq.PUB)
+    slide_pub.bind("tcp://*:5558")
+
+    # Keep only the last message to avoid processing history
+    blink_sub.setsockopt(zmq.CONFLATE, 1)
+    move_sub.setsockopt(zmq.CONFLATE, 1)
+
+    print("Core Unit: Waiting for signals...")
+
+    wait_start_time = 0.0
+    state = STATES["WAIT_FOR_BLINK"]
+    led_flag = FLAGS["BLINK_WAIT"]
+
+    # Initial LED update
+    time.sleep(0.5)
+    led_pub.send_json({"flag": led_flag})
     
-    # Subscriber: Receives blink signals
-    blinker_sub = context.socket(zmq.SUB)
-    blinker_sub.connect("tcp://localhost:5555")
-    blinker_sub.setsockopt_string(zmq.SUBSCRIBE, "")
+    # Logic variables
+    move_armed = False 
+    
+    try:
+        while True:
+            time.sleep(0.01) # CPU Saver
 
-    # Subscriber: Receives movement signals (jaw/head)
-    mover_sub = context.socket(zmq.SUB)
-    mover_sub.connect("tcp://localhost:5556")
-    mover_sub.setsockopt_string(zmq.SUBSCRIBE, "")
+            # State Machine
+            match state:
+                # --- STATE 0: WAIT FOR BLINK (Trigger) ---
+                case 0: # WAIT_FOR_BLINK
+                    try:
+                        # Non-blocking receive
+                        msg = blink_sub.recv_json(flags=zmq.NOBLOCK)
+                        if msg.get("blink") == 1:
+                            print(">>> TRIGGER: Blink Detected!")
+                            state = STATES["PREPARE_TO_LISTEN"]
+                            wait_start_time = time.time()
+                            
+                            # Original code logic: transition to PREPARE, LED update happens there
+                    except zmq.Again:
+                        pass
 
-    # Publisher: Sends status flags to visual feedback (lamp)
-    lamp_pub = context.socket(zmq.PUB)
-    lamp_pub.bind("tcp://*:5557")
-
-    # Publisher: Sends final commands to the presentation player
-    presentation_pub = context.socket(zmq.PUB)
-    presentation_pub.bind("tcp://*:5558")
-
-    # Conflate: Keep only the latest message to avoid lag
-    blinker_sub.setsockopt(zmq.CONFLATE, 1)
-    mover_sub.setsockopt(zmq.CONFLATE, 1)
-
-    print("Waiting for signals...")
-
-    current_wait_time = 0.0
-    wait_begin_time = 0.0
-
-    # Initial state
-    current_state = STATES["BLINK_WAIT"]
-    lamp_flag = FLAGS["BLI"]
-
-    while True:
-        try:
-            match current_state:
-                # STATE 0: Waiting for a blink trigger
-                case 0:
-                    msg_blink = blinker_sub.recv_json()
-                    blink_status = msg_blink.get("blink", 0)
-
-                    if blink_status == 1:
-                        # Blink detected -> Transition to WAIT state
-                        lamp_flag = FLAGS["BLI"]
-                        msg = {"flag": lamp_flag}
-                        lamp_pub.send_json(msg)
-                        
-                        current_state = STATES["WAIT"]
-                        wait_begin_time = time.time()
-                        print("BLINK DETECTED")
-
-                # STATE 1: Cooldown/Preparation period after blink
-                case 1:
-                    current_wait_time = time.time() - wait_begin_time
-                    # print("WAITING...") # Debug
-                    
+                # --- STATE 1: PREPARATION (Debounce/Ready) ---
+                case 1: # PREPARE_TO_LISTEN
+                    current_wait_time = time.time() - wait_start_time
                     if current_wait_time >= READY_TIME:
-                        # Ready time elapsed -> Enable movement detection
-                        lamp_flag = FLAGS["RDY"]
-                        msg = {"flag": lamp_flag}
-                        lamp_pub.send_json(msg)
+                        print(">>> SYSTEM READY: Listening for moves.")
+                        state = STATES["WAIT_FOR_MOVE"]
                         
-                        current_state = STATES["MOVE_WAIT"]
-
-                # STATE 2: Waiting for movement (Jaw/Head) command
-                case 2:
-                    msg_move = mover_sub.recv_json()
-                    move_signal = msg_move.get("move", 0)
-
-                    # 1 = Next Slide, -1 = Previous Slide
-                    if move_signal == 1 or move_signal == -1:
-                        # Command received -> Forward to player and REST
-                        msg = {"move": move_signal}
-                        presentation_pub.send_json(msg)
+                        # Set LED to Green
+                        led_flag = FLAGS["READY"]
+                        led_pub.send_json({"flag": led_flag})
                         
-                        current_state = STATES["REST"]
-                        wait_begin_time = time.time()
-                        print(f"COMMAND EXECUTED: {move_signal}")
+                        # Enable move detection logic
+                        move_armed = True
 
-                # STATE 3: Rest period after command execution
-                case 3:
-                    current_wait_time = time.time() - wait_begin_time
-                    # print("RESTING...") # Debug
-                    
+                # --- STATE 2: LISTEN FOR MOVE (Action) ---
+                case 2: # WAIT_FOR_MOVE
+                    try:
+                        msg = move_sub.recv_json(flags=zmq.NOBLOCK)
+                        move_signal = msg.get("move", 0)
+
+                        if not move_armed:
+                            # Flush old messages if not armed (safety)
+                            pass
+                        else:
+                            # React only if system is "armed"
+                            if move_signal == 1 or move_signal == -1:
+                                slide_msg = {"move": move_signal}
+                                slide_pub.send_json(slide_msg)
+                                
+                                state = STATES["RESTING"]
+                                wait_start_time = time.time()
+                                print(f">>> MOVE EXECUTED: {move_signal}")
+                                
+                                # Reset for future
+                                move_armed = False
+                                
+                                # Set LED to Orange (Rest)
+                                led_flag = FLAGS["REST"]
+                                led_pub.send_json({"flag": led_flag})
+
+                    except zmq.Again:
+                        pass
+
+                # --- STATE 3: REST (Cooldown) ---
+                case 3: # RESTING
+                    current_wait_time = time.time() - wait_start_time
                     if current_wait_time >= REST_TIME:
-                        # Rest time elapsed -> Reset to Blink Wait
-                        lamp_flag = FLAGS["RST"]
-                        msg = {"flag": lamp_flag}
-                        lamp_pub.send_json(msg)
+                        # Back to Red LED
+                        led_flag = FLAGS["BLINK_WAIT"]
+                        led_pub.send_json({"flag": led_flag})
                         
-                        current_state = STATES["BLINK_WAIT"]
+                        state = STATES["WAIT_FOR_BLINK"]
+                        print(">>> BACK TO BLINK WATCH")
 
-        except KeyboardInterrupt:
-            print("Core unit stopping...")
-            break
+    except KeyboardInterrupt:
+        print("Core Unit shutting down.")
+    finally:
+        context.term()
 
 if __name__ == '__main__':
-    core_unit()
+    run_core_unit()
