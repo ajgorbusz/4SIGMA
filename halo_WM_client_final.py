@@ -5,88 +5,79 @@ import zmq
 from scipy.signal import butter, sosfilt
 
 # --- 0. CONFIGURATION ---
-ANALYSIS_CHANNELS = ['O1', 'O2']  # Channels used for blink detection
-WINDOW_TIME = 5.0                 # Buffer duration in seconds
-SFREQ = 250                       # Sampling frequency
+ANALYZED_CHANNELS = ['O1', 'O2'] # Channels used to detect blinks
+WINDOW_TIME = 5.0      
+SAMPLING_FREQ = 250
 
-# Derivative threshold (Volts/s) for blink detection
+# Detection Threshold (Derivative of Voltage)
 DERIVATIVE_THRESHOLD = 20000.0  
 
 # --- GLOBAL VARIABLES ---
-N_CH_INPUT = len(ANALYSIS_CHANNELS) 
-BUFFER_SIZE = int(SFREQ * WINDOW_TIME)
+NUM_INPUT_CHANNELS = len(ANALYZED_CHANNELS)
+BUFFER_SIZE = int(SAMPLING_FREQ * WINDOW_TIME)
 
-# Data buffer (Volts)
-eeg_buffer = np.zeros((N_CH_INPUT, BUFFER_SIZE)) 
+# Data Buffer (Volts)
+eeg_buffer = np.zeros((NUM_INPUT_CHANNELS, BUFFER_SIZE)) 
 
-# Signal Filters
-sos_high = butter(2, 0.3, btype='highpass', fs=SFREQ, output='sos')
-sos_low = butter(2, 20.0, btype='lowpass', fs=SFREQ, output='sos')
+# Filters
+sos_high = butter(2, 0.3, btype='highpass', fs=SAMPLING_FREQ, output='sos')
+sos_low = butter(2, 20.0, btype='lowpass', fs=SAMPLING_FREQ, output='sos')
 
 def run_blink_detector():
-    """
-    Reads raw EEG data from ZMQ Relay, filters it, calculates the derivative,
-    and detects blinks based on a threshold. Sends result to Core Unit.
-    """
     global eeg_buffer
 
-    # --- 1. ZMQ SETUP ---
+    # --- 1. ZMQ CONFIGURATION ---
     context = zmq.Context()
 
-    # SUBSCRIBER: Receive raw data from Relay (Port 6000)
+    # SUBSCRIBER (Data from Router - port 6000)
     sub_socket = context.socket(zmq.SUB)
     sub_socket.connect("tcp://localhost:6000") 
     sub_socket.setsockopt_string(zmq.SUBSCRIBE, "") 
-    # Note: No CONFLATE here, we need continuous data for filtering
+    # No CONFLATE, because we need continuous data for filters!
 
-    # PUBLISHER: Send detection result to Core Unit (Port 5555)
+    # PUBLISHER (Events to Core Unit - port 5555)
     pub_socket = context.socket(zmq.PUB)
     pub_socket.bind("tcp://*:5555")
 
     print(f"--- BLINK DETECTOR STARTED ---")
-    print(f"Listening on port 6000 (Relay)...")
-    print(f"Sending to port 5555 (Core Unit)...")
-    print(f"Threshold: {DERIVATIVE_THRESHOLD}")
+    print(f"Listening on: 6000, Publishing to: 5555")
 
-    while True:
-        try:
+    try:
+        while True:
             # --- 2. RECEIVE DATA ---
-            # Receive raw chunk: dictionary {'Fp1': [val], 'O1': [val]...}
-            data_chunk = sub_socket.recv_json()
+            # Packet format: {"data": [[ch1...], [ch2...]]}
+            msg = sub_socket.recv_json()
             
-            # Extract only required channels (O1, O2)
-            new_samples = []
-            for ch_name in ANALYSIS_CHANNELS:
-                val = data_chunk.get(ch_name)
-                # Ensure it's a list (BrainAccess usually sends single sample per packet here)
-                if isinstance(val, (float, int)):
-                    val = [val]
-                new_samples.append(val)
+            raw_data = np.array(msg.get("data"))
+            # Expecting full packet from Halo (4 channels usually), 
+            # we need to extract O1 and O2.
+            # Assuming Halo sends [Fp1, Fp2, O1, O2], indices 2 and 3 are Occipital.
             
-            new_samples = np.array(new_samples) # Shape: (n_channels, n_samples)
-            chunk_len = new_samples.shape[1]
+            if raw_data.shape[0] < 4:
+                continue
+                
+            # Selecting only O1, O2
+            new_chunk = raw_data[2:4, :] 
+            chunk_len = new_chunk.shape[1]
 
-            # --- 3. UPDATE RING BUFFER ---
-            # Shift buffer left
-            eeg_buffer[:, :-chunk_len] = eeg_buffer[:, chunk_len:]
-            # Insert new data at the end
-            eeg_buffer[:, -chunk_len:] = new_samples
-            
+            # --- 3. UPDATE BUFFER ---
+            eeg_buffer = np.roll(eeg_buffer, -chunk_len, axis=1)
+            eeg_buffer[:, -chunk_len:] = new_chunk
+
             # --- 4. SIGNAL PROCESSING ---
-            # Remove DC offset (baseline correction)
+            # Remove DC Offset (Centering)
             dc_offset_local = np.mean(eeg_buffer, axis=1, keepdims=True)
             data_centered = eeg_buffer - dc_offset_local
             
-            # Apply Bandpass Filter (0.3 - 20 Hz)
-            # Processing Channel 0 (O1) primarily
-            clean_signal = sosfilt(sos_low, sosfilt(sos_high, data_centered[0]))
+            # Filtering (Analyzing Channel 0 of the buffer -> O1)
+            clean_o1 = sosfilt(sos_low, sosfilt(sos_high, data_centered[0]))
             
             # Calculate Derivative (Rate of change)
-            derivative_trace = np.diff(clean_signal, prepend=clean_signal[0]) * SFREQ
+            deriv_trace_o1 = np.diff(clean_o1, prepend=clean_o1[0]) * SAMPLING_FREQ
             
-            # Analyze only the newest segment to avoid re-detecting old blinks
-            check_len = max(chunk_len, int(SFREQ * 0.1))
-            last_deriv_segment = derivative_trace[-check_len:]
+            # Detection only on NEW segment (to avoid re-triggering old blinks)
+            check_len = max(chunk_len, int(SAMPLING_FREQ * 0.1))
+            last_deriv_segment = deriv_trace_o1[-check_len:]
             
             max_deriv = np.max(np.abs(last_deriv_segment))
             
@@ -97,20 +88,20 @@ def run_blink_detector():
                 print(f">>> BLINK DETECTED! (d/dt: {max_deriv:.2f})")
                 status_to_send = 1
             
-            # Live logging (overwrite line)
+            # Inline logging (overwriting line)
             sys.stdout.write(f"\rMax d/dt: {max_deriv:.2f} | Status: {status_to_send}   ")
             sys.stdout.flush()
 
             # --- 6. SEND RESULT TO CORE UNIT ---
-            msg = {"blink": status_to_send}
-            pub_socket.send_json(msg)
+            if status_to_send == 1:
+                pub_socket.send_json({"blink": 1})
 
-        except KeyboardInterrupt:
-            print("\nBlink Detector stopped.")
-            break
-        except Exception as e:
-            print(f"Error: {e}")
-            time.sleep(0.01)
+    except KeyboardInterrupt:
+        print("\nBlink Detector stopped.")
+    except Exception as e:
+        print(f"\nError: {e}")
+    finally:
+        context.term()
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     run_blink_detector()
