@@ -3,142 +3,103 @@ import zmq
 import threading
 import tkinter as tk
 from enum import Enum
-import signal
 
-# --- 0. CONFIGURATION ---
-ZMQ_HOST = "tcp://localhost:5557"  # Core Unit Publisher Address
-TRANSPARENT_BG = '#010101'         # Color key for transparency
+# --- ZMQ CONFIGURATION ---
+ZMQ_HOST = "tcp://localhost:5557"
 
-# --- 1. COLOR DEFINITIONS ---
+# --- COLOR DEFINITIONS ---
 class LedColor(Enum):
-    """
-    Enum defining the colors for system states.
-    """
-    RED = "#FF0000"      # State: BLINK_WAIT (Listening for blink) / REST
-    ORANGE = "#FFA500"   # State: WAIT (Cooldown) / DETECTED
-    GREEN = "#00FF00"    # State: READY (Listening for jaw/head commands)
+    RED = "#FF0000"      # Listening / Waiting
+    ORANGE = "#FFA500"   # Rest / Cooldown
+    GREEN = "#00FF00"    # Ready for command
 
-# --- 2. GUI CLASS ---
+# --- WINDOW SETTINGS ---
+TRANSPARENT_BG_COLOR = '#010101' 
+
 class LedOverlay:
     """
-    Creates a transparent, topmost overlay window containing a single colored circle (LED).
-    This provides visual feedback to the user on top of the presentation.
+    Creates a transparent, always-on-top window with a colored circle.
     """
     def __init__(self):
         self.root = tk.Tk()
         
-        # Window Configuration
-        self.root.overrideredirect(True)       # Remove title bar and borders
-        self.root.wm_attributes("-topmost", True) # Keep window always on top
+        # 1. Remove Title Bar
+        self.root.overrideredirect(True)
         
-        # Transparency Configuration
-        # Note: -transparentcolor works on Windows. On Linux/Mac behavior might vary,
-        # but setting bg color is standard fallback.
-        self.root.config(bg=TRANSPARENT_BG)
+        # 2. Keep Always on Top
+        self.root.wm_attributes("-topmost", True)
+        
+        # 3. Set Transparency
+        self.root.config(bg=TRANSPARENT_BG_COLOR)
         try:
-            self.root.wm_attributes("-transparentcolor", TRANSPARENT_BG)
+            self.root.wm_attributes("-transparentcolor", TRANSPARENT_BG_COLOR)
         except tk.TclError:
-            pass 
+            pass
 
-        # Dimensions and Position
+        # Geometry
         self.size = 50
         screen_width = self.root.winfo_screenwidth()
         screen_height = self.root.winfo_screenheight()
         
-        # Position: Bottom-Right corner
+        # Position: Bottom Right Corner
         x_pos = screen_width - self.size - 20
         y_pos = screen_height - self.size - 20
         self.root.geometry(f"{self.size}x{self.size}+{x_pos}+{y_pos}")
-        
-        # Canvas Setup
-        self.canvas = tk.Canvas(
-            self.root, 
-            width=self.size, 
-            height=self.size, 
-            bg=TRANSPARENT_BG, 
-            highlightthickness=0
-        )
+
+        # Canvas
+        self.canvas = tk.Canvas(self.root, width=self.size, height=self.size, 
+                                bg=TRANSPARENT_BG_COLOR, highlightthickness=0)
         self.canvas.pack()
         
-        # Draw Initial LED (Red by default)
-        self.led_item = self.draw_led(LedColor.RED.value)
+        # Draw Initial Circle (Red)
+        self.indicator = self.canvas.create_oval(2, 2, self.size-2, self.size-2, 
+                                                 fill=LedColor.RED.value, outline="")
 
-    def draw_led(self, color):
-        """Draws the circle on the canvas."""
-        padding = 5
-        return self.canvas.create_oval(
-            padding, padding, 
-            self.size - padding, self.size - padding, 
-            fill=color, outline=""
-        )
-
-    def update_state(self, flag_code):
+    def update_state(self, flag):
         """
-        Updates the LED color based on the flag received from Core Unit.
-        
-        Args:
-            flag_code (int): 
-                0 -> RED (Blink Wait)
-                1 -> ORANGE (Wait/Cooldown)
-                2 -> GREEN (Ready for Command)
+        Updates circle color based on flag.
         """
-        color = LedColor.RED.value  # Default
+        color = LedColor.RED.value
         
-        if flag_code == 0:
-            color = LedColor.RED.value
-        elif flag_code == 1:
-            color = LedColor.ORANGE.value
-        elif flag_code == 2:
+        if flag == 1:
             color = LedColor.GREEN.value
+        elif flag == 2:
+            color = LedColor.ORANGE.value
             
-        self.canvas.itemconfig(self.led_item, fill=color)
+        self.canvas.itemconfig(self.indicator, fill=color)
 
     def start(self):
-        """Starts the Tkinter main event loop."""
         self.root.mainloop()
-        
-    def stop(self):
-        """Destroys the window and stops the loop."""
-        self.root.quit()
 
-# --- 3. NETWORK LISTENER THREAD ---
 class ZmqListener(threading.Thread):
     """
-    Background thread that listens for status updates from the Core Unit via ZMQ
-    and updates the GUI accordingly.
+    Background thread for ZMQ listening.
     """
-    def __init__(self, gui_instance):
-        super().__init__()
-        self.gui = gui_instance
+    def __init__(self, gui):
+        threading.Thread.__init__(self)
+        self.gui = gui
         self.running = True
-        self.context = None
-        self.socket = None
+        self.daemon = True 
 
     def run(self):
-        """Main thread loop."""
-        self.context = zmq.Context()
-        self.socket = self.context.socket(zmq.SUB)
+        context = zmq.Context()
+        socket = context.socket(zmq.SUB)
         
-        # Set receive timeout to 1000ms to allow checking 'self.running' flag
-        self.socket.setsockopt(zmq.RCVTIMEO, 1000)
+        # Timeout 1000ms
+        socket.setsockopt(zmq.RCVTIMEO, 1000)
         
         try:
-            print(f"Connecting to ZMQ Core at: {ZMQ_HOST}...")
-            self.socket.connect(ZMQ_HOST)
-            self.socket.setsockopt_string(zmq.SUBSCRIBE, "") 
+            print(f"LED Controller: Connecting to {ZMQ_HOST}...")
+            socket.connect(ZMQ_HOST)
+            socket.setsockopt_string(zmq.SUBSCRIBE, "") 
             
             while self.running:
                 try:
-                    # Non-blocking receive (due to timeout)
-                    msg = self.socket.recv_json()
+                    msg = socket.recv_json()
                     flag = msg.get("flag")
-                    
                     if flag is not None:
-                        # Update GUI (Thread-safe enough for simple Tkinter updates)
                         self.gui.update_state(flag)
-                        
                 except zmq.Again:
-                    # Timeout reached, loop again to check self.running
                     continue
                 except zmq.ContextTerminated:
                     break
@@ -146,40 +107,23 @@ class ZmqListener(threading.Thread):
         except Exception as e:
             print(f"ZMQ Error: {e}")
         finally:
-            if self.socket: self.socket.close()
-            if self.context: self.context.term()
+            socket.close()
+            context.term()
 
-    def stop(self):
-        """Signals the thread to stop."""
-        self.running = False
-
-# --- 4. MAIN EXECUTION ---
-if __name__ == "__main__":
-    print("--- LED STATUS CONTROLLER (TRANSPARENT OVERLAY) ---")
-    print("Press Ctrl+C in terminal to exit.")
+def run_led_controller():
+    print("--- LED CONTROLLER (OVERLAY) ---")
+    print("Press Ctrl+C in terminal to stop.")
     
-    # Initialize GUI
     gui = LedOverlay()
-    
-    # Initialize and start Network Thread
     listener = ZmqListener(gui)
     listener.start()
     
-    # Handle Ctrl+C gracefully
-    def signal_handler(sig, frame):
-        print("\nExiting...")
-        listener.stop()
-        gui.stop()
-        sys.exit(0)
-
-    signal.signal(signal.SIGINT, signal_handler)
-    
     try:
-        # Start GUI Loop (Blocking)
         gui.start()
     except KeyboardInterrupt:
         pass
     finally:
-        listener.stop()
-        # Ensure thread finishes
-        listener.join(timeout=2.0)
+        listener.running = False
+
+if __name__ == "__main__":
+    run_led_controller()
